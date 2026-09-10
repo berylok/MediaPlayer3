@@ -76,7 +76,6 @@ VideoPlayer::VideoPlayer(QWidget *parent)
     // 初始化随机数种子
     std::srand(static_cast<unsigned>(std::time(nullptr)));
 
-    registerFileAssociation();
     setAcceptDrops(true);  // 启用拖放
 
     // 获取应用程序配置目录（跨平台）
@@ -183,9 +182,12 @@ VideoPlayer::~VideoPlayer() {
         qDebug() << "保存音量:" << audioOutput->volume();
     }
     // QSettings和其他Qt对象会自动清理，因为它们的父对象是this
+    delete osdLabel;
+
 }
 
 void VideoPlayer::closeEvent(QCloseEvent *event) {
+    m_loopingJumpInProgress = false;
     // 保存当前窗口状态 ini
     if (settings) {
         settings->setValue("windowGeometry", saveGeometry());
@@ -206,10 +208,6 @@ void VideoPlayer::closeEvent(QCloseEvent *event) {
 
 void VideoPlayer::setupUI()
 {
-    // 原来：
-    // osdLabel = new QLabel(videoWidget);
-
-    // 改为：
     osdLabel = new QLabel(nullptr);  // 没有父对象，独立窗口
     osdLabel->setWindowFlags(Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
     osdLabel->setAlignment(Qt::AlignCenter);
@@ -224,7 +222,8 @@ void VideoPlayer::setupUI()
         "}"
         );
     osdLabel->hide();
-
+    osdLabel->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+    osdLabel->installEventFilter(this);
 
     QWidget *centralWidget = new QWidget(this);
     QVBoxLayout *mainLayout = new QVBoxLayout(centralWidget);
@@ -260,10 +259,6 @@ void VideoPlayer::setupUI()
         updateControlPanelPosition();
     }
 
-    // 连接信号槽
-    connect(player, &QMediaPlayer::errorOccurred, [](QMediaPlayer::Error error) {
-        qDebug() << "Media player error:" << error;
-    });
 
     // 定时更新进度条
     connect(updateTimer, &QTimer::timeout, this, [this]() {
@@ -343,19 +338,15 @@ void VideoPlayer::leaveEvent(QEvent *event)
 // 添加AB点循环检查函数
 void VideoPlayer::checkABLoop()
 {
-    if (!isABLoopEnabled || loopPointA == -1 || loopPointB == -1) {
-        return;
-    }
+    if (!isABLoopEnabled || loopPointA < 0 || loopPointB < 0) return;
+    if (m_loopingJumpInProgress) return;   //
 
-    qint64 currentPos = player->position();
-    qint64 duration = player->duration();
-
-    // 如果当前播放位置超过B点，跳转到A点
-    if (currentPos >= loopPointB) {
-        // 稍微提前一点跳转，避免卡顿
+    if (player->position() >= loopPointB) {
+        m_loopingJumpInProgress = true;
         player->setPosition(loopPointA);
-        qDebug() << "AB点循环: 从" << formatTime(currentPos)
-                 << "跳转到" << formatTime(loopPointA);
+        QTimer::singleShot(100, this, [this]() {
+            m_loopingJumpInProgress = false;
+        });
     }
 }
 
@@ -457,6 +448,7 @@ void VideoPlayer::setupControlPanel()
     volumeButton->setStyleSheet("background-color: transparent; border: none;");
 
     QSlider *volumeSlider = new QSlider(Qt::Horizontal, this);
+    volumeSlider->setObjectName("volumeSlider");
     volumeSlider->setFocusPolicy(Qt::NoFocus);
     volumeSlider->setRange(0, 100);
     if (audioOutput) {
@@ -519,12 +511,6 @@ void VideoPlayer::setupControlPanel()
     abInfoLabel->setFixedWidth(105);
     abInfoLabel->setText("AB点: 未设置");
 
-    // ---- 速度控制占位 ----
-    speedControlWidget = new QWidget(this);
-    QHBoxLayout *speedLayout = new QHBoxLayout(speedControlWidget);
-    speedLayout->setContentsMargins(0, 0, 0, 0);
-    speedLayout->setSpacing(5);
-    speedControlWidget->setLayout(speedLayout);
 
     // 添加到布局
     controlLayout->addWidget(playPauseButton);
@@ -532,7 +518,7 @@ void VideoPlayer::setupControlPanel()
     controlLayout->addWidget(positionSlider, 1);
     controlLayout->addWidget(timeLabel);
     controlLayout->addWidget(abInfoLabel);
-    controlLayout->addWidget(speedControlWidget);
+
     controlLayout->addWidget(volumeWidget);
 
     controlPanel->hide();
@@ -609,45 +595,33 @@ void VideoPlayer::updateProgress()
     if (!positionSlider || !player || player->duration() <= 0) return;
 
     qint64 current = player->position();
-    qint64 total = player->duration();
+    qint64 total   = player->duration();
 
-    // ---- 新增：无缝循环提前跳转 ----
-    if (isLooping && total > 0) {
-        const qint64 earlyThreshold = 300; // 提前量（毫秒），可调
-        // 如果当前播放位置距离末尾不足阈值，且尚未触发跳转
-        if (total - current < earlyThreshold && current < total) {
-            static bool jumping = false;
-            if (!jumping) {
-                jumping = true;
+    // 无缝循环：提前 300ms 跳转
+    if (isLooping && !m_loopingJumpInProgress && !isABLoopEnabled) {  // ← 加 !isABLoopEnabled，避免和 AB 抢
+        if (total - current < 300 && current < total) {
+            m_loopingJumpInProgress = true;
 
-                // 可选：临时静音，消除解码重置时的爆音（如需要）
-                float origVol = audioOutput ? audioOutput->volume() : 1.0f;
-                if (audioOutput) audioOutput->setVolume(0.0f);
+            const float origVol = audioOutput ? audioOutput->volume() : 1.0f;
+            if (audioOutput) audioOutput->setVolume(0.0f);
 
-                // 跳转到开头（0毫秒）
-                player->setPosition(0);
-                // 如果播放状态意外丢失，重新启动（一般不会）
-                if (player->playbackState() != QMediaPlayer::PlayingState) {
-                    player->play();
-                }
-
-                // 延迟恢复音量（100ms 足够掩盖重置声）
-                QTimer::singleShot(100, this, [this, origVol]() {
-                    if (audioOutput) audioOutput->setVolume(origVol);
-                    jumping = false;
-                });
+            player->setPosition(0);
+            if (player->playbackState() != QMediaPlayer::PlayingState) {
+                player->play();
             }
-            // 跳转后，本次更新不再继续更新进度条（避免显示负数）
-            // 但为了保险，仍然执行下面的进度条更新（设置到0）
-            current = 0; // 强制进度条归零
+
+            QTimer::singleShot(100, this, [this, origVol]() {
+                if (audioOutput && audioOutput->volume() < 0.001f) {
+                    audioOutput->setVolume(origVol);
+                }
+                m_loopingJumpInProgress = false;
+            });
+
+            return;   // 本帧不刷 UI
         }
     }
-    // ---- 新增结束 ----
 
-    // 更新进度条（使用修正后的current）
     positionSlider->setValue(static_cast<int>((current * 1000) / total));
-
-    // 更新时间标签
     updateTimeLabel(current, total);
 }
 
@@ -747,31 +721,7 @@ void VideoPlayer::mousePressEvent(QMouseEvent *event)
 
 void VideoPlayer::wheelEvent(QWheelEvent *event)
 {
-    if (!audioOutput) return;
-
-    const float step = 0.01f;
-    float currentVolume = audioOutput->volume();
-    if (event->angleDelta().y() > 0)
-        currentVolume = qMin(currentVolume + step, 1.0f);
-    else
-        currentVolume = qMax(currentVolume - step, 0.0f);
-
-    audioOutput->setVolume(currentVolume);
-    float newVolume = audioOutput->volume();
-
-    int percent = static_cast<int>(newVolume * 100);
-
-    osdLabel->setText(QString("音量: %1%").arg(percent));
-    osdLabel->adjustSize();
-
-    // 将 OSD 窗口移动到主窗口中央（使用全局坐标）
-    QPoint center = this->mapToGlobal(this->rect().center());
-    osdLabel->move(center - QPoint(osdLabel->width()/2, osdLabel->height()/2));
-    osdLabel->show();
-
-    // 启动定时器，2秒后隐藏
-    volumeHideTimer->start(2000);
-
+    adjustVolumeByWheel(event->angleDelta().y());
     event->accept();
 }
 
@@ -865,116 +815,17 @@ void VideoPlayer::setupMenu()
 void VideoPlayer::toggleLoopPlayback()
 {
     isLooping = !isLooping;
-
-    if (loopAction) {
-        loopAction->setChecked(isLooping);
-    }
-
-    // 设置或取消循环播放
-    if (isLooping) {
-        qDebug() << "循环播放已开启";
-        // 连接播放结束信号
-        if (player) {
-            connect(player, &QMediaPlayer::playbackStateChanged,
-                    this, &VideoPlayer::handleLoopPlayback);
-        }
-    } else {
-        qDebug() << "循环播放已关闭";
-        // 断开连接
-        if (player) {
-            disconnect(player, &QMediaPlayer::playbackStateChanged,
-                       this, &VideoPlayer::handleLoopPlayback);
-        }
-    }
+    if (loopAction) loopAction->setChecked(isLooping);
+    qDebug() << "循环播放:" << (isLooping ? "开" : "关");
+    // ⚠️ 不再 connect/disconnect
 }
 
-// 处理循环播放逻辑
-void VideoPlayer::handleLoopPlayback(QMediaPlayer::PlaybackState state)
-{
-    if (!isLooping || !player) return; // 如果不是循环模式或播放器无效，直接返回
-
-    // 当播放结束时（从播放状态变为停止状态）
-    if (state == QMediaPlayer::StoppedState) {
-        qDebug() << "视频播放结束，重新开始循环播放";
-
-        // 延迟一小段时间后重新播放，避免立即重启的问题
-        QTimer::singleShot(100, this, [this]() {
-            if (isLooping && player) {
-                player->setPosition(0);
-                player->play();
-            }
-        });
-    }
-}
 
 void VideoPlayer::paintEvent(QPaintEvent *event) {
     QMainWindow::paintEvent(event); // 先调用父类绘制
 
 }
 
-void VideoPlayer::drawABMarkers(QPaintEvent *event)
-{
-    Q_UNUSED(event);
-
-    if (!positionSlider || !player || player->duration() <= 0) return;
-    if (loopPointA == -1 && loopPointB == -1) return;
-
-    if (!positionSlider->isVisible()) return;
-
-    QPainter painter(this);
-    painter.setRenderHint(QPainter::Antialiasing);
-
-    // 获取进度条位置
-    QRect sliderRect = positionSlider->geometry();
-    QPoint sliderTopLeft = positionSlider->mapTo(this, QPoint(0, 0));
-    sliderRect.moveTopLeft(sliderTopLeft);
-
-    qint64 duration = player->duration();
-    if (duration <= 0) return;
-
-    // 圆形标记半径
-    int markerRadius = 8;
-
-    // 绘制A点圆形标记
-    if (loopPointA != -1) {
-        double aRatio = static_cast<double>(loopPointA) / duration;
-        aRatio = qBound(0.0, aRatio, 1.0);
-
-        int xPos = sliderRect.left() + static_cast<int>(aRatio * sliderRect.width());
-        xPos = qBound(sliderRect.left() + markerRadius, xPos, sliderRect.right() - markerRadius);
-        int yPos = sliderRect.top() - markerRadius - 5;  // 在滑块上方
-
-        // 绘制填充圆形
-        painter.setBrush(QBrush(QColor(255, 100, 100, 220)));  // 半透明红色
-        painter.setPen(QPen(Qt::red, 2));
-        painter.drawEllipse(QPoint(xPos, yPos), markerRadius, markerRadius);
-
-        // 绘制"A"文字
-        painter.setPen(Qt::white);
-        painter.setFont(QFont("Arial", 9, QFont::Bold));
-        painter.drawText(xPos - 4, yPos + 4, "A");
-    }
-
-    // 绘制B点圆形标记
-    if (loopPointB != -1) {
-        double bRatio = static_cast<double>(loopPointB) / duration;
-        bRatio = qBound(0.0, bRatio, 1.0);
-
-        int xPos = sliderRect.left() + static_cast<int>(bRatio * sliderRect.width());
-        xPos = qBound(sliderRect.left() + markerRadius, xPos, sliderRect.right() - markerRadius);
-        int yPos = sliderRect.top() - markerRadius - 20;  // 在A点上方
-
-        // 绘制填充圆形
-        painter.setBrush(QBrush(QColor(100, 100, 255, 220)));  // 半透明蓝色
-        painter.setPen(QPen(Qt::blue, 2));
-        painter.drawEllipse(QPoint(xPos, yPos), markerRadius, markerRadius);
-
-        // 绘制"B"文字
-        painter.setPen(Qt::white);
-        painter.setFont(QFont("Arial", 9, QFont::Bold));
-        painter.drawText(xPos - 4, yPos + 4, "B");
-    }
-}
 
 void VideoPlayer::keyPressEvent(QKeyEvent *event) {
     if (!player) {
@@ -1037,7 +888,6 @@ void VideoPlayer::adjustVolume(float delta) {
 
     // 设置新音量
     audioOutput->setVolume(newVolume);
-
     // 更新音量滑块（如果存在）
     updateVolumeSlider(newVolume);
 
@@ -1070,25 +920,18 @@ void VideoPlayer::updateVolumeSlider(float volume)
 {
     if (!controlPanel) return;
 
-    // 查找控制面板中的音量滑块
-    QSlider* volumeSlider = controlPanel->findChild<QSlider*>();
+    // ★ 按 objectName 精确定位，不再猜
+    QSlider *volumeSlider = controlPanel->findChild<QSlider*>("volumeSlider");
+    if (!volumeSlider) return;
 
-    // 或者使用更精确的方法：查找特定类型的控件
-    QList<QSlider*> sliders = controlPanel->findChildren<QSlider*>();
-    for (QSlider* slider : sliders) {
-        // 检查这个滑块是否可能是音量滑块（通过范围或样式等）
-        if (slider && slider->maximum() == 100 && slider != positionSlider) {
-            int volumePercent = static_cast<int>(volume * 100);
-            // 防止信号循环：先断开连接，更新值，再重新连接
-            bool wasBlocked = slider->blockSignals(true);
-            slider->setValue(volumePercent);
-            slider->blockSignals(wasBlocked);
+    const int volumePercent = static_cast<int>(qRound(volume * 100));
 
-            // 更新音量按钮图标
-            updateVolumeButtonIcon(volumePercent);
-            break;
-        }
-    }
+    // 防止 valueChanged → 递归
+    const bool wasBlocked = volumeSlider->blockSignals(true);
+    volumeSlider->setValue(volumePercent);
+    volumeSlider->blockSignals(wasBlocked);
+
+    updateVolumeButtonIcon(volumePercent);
 }
 
 void VideoPlayer::openFile(const QString &filePath) {
@@ -1153,14 +996,6 @@ void VideoPlayer::dropEvent(QDropEvent *event)
     } else {
         qDebug() << "不支持的文件类型:" << mimeType.name() << "扩展名:" << suffix;
     }
-}
-
-void VideoPlayer::registerFileAssociation() {
-    QSettings settings("HKEY_CLASSES_ROOT\\.mp4", QSettings::NativeFormat);
-    settings.setValue(".", "VideoPlayer");  // 关联 .mp4 到 VideoPlayer
-
-    QSettings appSettings("HKEY_CLASSES_ROOT\\VideoPlayer\\shell\\open\\command", QSettings::NativeFormat);
-    appSettings.setValue(".", QString("\"%1\" \"%2\"").arg(QCoreApplication::applicationFilePath()).arg("%1"));
 }
 
 
@@ -2190,96 +2025,6 @@ QImage VideoPlayer::getCurrentVideoFrame()
     return QImage();
 }
 
-// 创建测试图像
-QImage VideoPlayer::createTestImage()
-{
-    int width = 800;
-    int height = 600;
-
-    QImage image(width, height, QImage::Format_RGB32);
-
-    // 填充背景
-    image.fill(QColor(30, 30, 30));
-
-    QPainter painter(&image);
-    painter.setRenderHint(QPainter::Antialiasing);
-
-    // 绘制渐变背景
-    QLinearGradient gradient(0, 0, width, height);
-    gradient.setColorAt(0, QColor(50, 50, 100));
-    gradient.setColorAt(0.5, QColor(80, 50, 80));
-    gradient.setColorAt(1, QColor(100, 50, 50));
-    painter.fillRect(image.rect(), gradient);
-
-    // 绘制标题
-    painter.setPen(QPen(Qt::white, 3));
-    painter.setFont(QFont("Arial", 28, QFont::Bold));
-    painter.drawText(QRect(0, 50, width, 60), Qt::AlignCenter, "视频截图预览");
-
-    // 绘制边框
-    painter.setPen(QPen(QColor(255, 215, 0), 4));  // 金色边框
-    painter.drawRect(20, 20, width - 40, height - 40);
-
-    // 绘制信息区域 - 修正播放状态判断
-    painter.setPen(Qt::white);
-    painter.setFont(QFont("Arial", 14));
-
-    QString playerState = "未知状态";
-    if (player) {
-        switch (player->playbackState()) {
-        case QMediaPlayer::PlayingState:
-            playerState = "播放中";
-            break;
-        case QMediaPlayer::PausedState:
-            playerState = "已暂停";
-            break;
-        case QMediaPlayer::StoppedState:
-            playerState = "已停止";
-            break;
-        default:
-            playerState = "未知";
-            break;
-        }
-    } else {
-        playerState = "无播放器";
-    }
-
-    QString infoText = QString(
-                           "截图信息：\n"
-                           "时间：%1\n"
-                           "状态：%2\n"
-                           "视频窗口：%3x%4\n"
-                           "备注：如果看到此图像，表示视频截图功能\n"
-                           "需要进一步调试或视频可能处于未播放状态")
-                           .arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"))
-                           .arg(playerState)
-                           .arg(videoWidget ? videoWidget->width() : 0)
-                           .arg(videoWidget ? videoWidget->height() : 0);
-
-    painter.drawText(QRect(50, 150, width - 100, 250), Qt::AlignCenter | Qt::TextWordWrap, infoText);
-
-    // 绘制一个简单的视频帧示意图
-    QRect frameRect(width/4, height - 200, width/2, 150);
-    painter.fillRect(frameRect, QColor(0, 0, 0, 200));
-
-    // 在示意图中绘制一些内容
-    painter.setPen(QPen(Qt::green, 2));
-    for (int i = 0; i < 5; i++) {
-        int x = frameRect.left() + i * (frameRect.width() / 4);
-        painter.drawLine(x, frameRect.top(), x, frameRect.bottom());
-    }
-
-    painter.setPen(QPen(Qt::red, 2));
-    painter.drawEllipse(frameRect.center(), 20, 20);
-
-    painter.setPen(QPen(Qt::blue, 2));
-    painter.drawText(frameRect, Qt::AlignCenter, "视频帧示意图");
-
-    painter.end();
-
-    qDebug() << "创建测试图像完成，尺寸:" << image.size();
-    return image;
-}
 
 QImage VideoPlayer::captureScreenArea()
 {
@@ -2315,46 +2060,6 @@ QImage VideoPlayer::captureScreenArea()
         result.save(path);
         qDebug() << "屏幕截图保存到:" << path;
     }
-
-    return result;
-}
-
-QImage VideoPlayer::captureWithWorkaround()
-{
-    qDebug() << "尝试硬件加速绕过方法...";
-
-    // 方法A：禁用硬件加速（临时）
-    qputenv("QT_MEDIA_DISABLE_HW_DECODING", "1");
-    qDebug() << "临时禁用硬件加速";
-
-    // 重新创建视频输出
-    if (player) {
-        player->setVideoOutput(nullptr);
-    }
-    QThread::msleep(100);
-
-    QVideoWidget *tempWidget = new QVideoWidget(this);
-    tempWidget->setAttribute(Qt::WA_OpaquePaintEvent, false);
-    tempWidget->setAttribute(Qt::WA_NoSystemBackground, false);
-
-    if (player) {
-        player->setVideoOutput(tempWidget);
-    }
-
-    QCoreApplication::processEvents();
-    QThread::msleep(200);
-
-    // 截图
-    QImage result = tempWidget->grab().toImage();
-
-    // 恢复原来的视频窗口
-    if (player) {
-        player->setVideoOutput(videoWidget);
-    }
-    delete tempWidget;
-
-    // 恢复硬件加速设置
-    qunsetenv("QT_MEDIA_DISABLE_HW_DECODING");
 
     return result;
 }
@@ -2974,23 +2679,28 @@ void VideoPlayer::exportABLoop()
         ffmpeg->deleteLater();
     });
 
-    // 可选：显示进度对话框（简单起见仅显示等待光标）
+    // 连接错误信号，处理启动失败
+    connect(ffmpeg, &QProcess::errorOccurred, this,
+            [=](QProcess::ProcessError) {
+                QApplication::restoreOverrideCursor();
+                QMessageBox::critical(this, "导出失败", "无法启动 FFmpeg，请确认已安装。");
+                ffmpeg->deleteLater();
+            });
+
     QApplication::setOverrideCursor(Qt::WaitCursor);
     ffmpeg->start(program, args);
-    if (!ffmpeg->waitForStarted(3000)) {
-        QApplication::restoreOverrideCursor();
-        QMessageBox::critical(this, "导出失败", "无法启动 FFmpeg，请确认已安装 ffmpeg 并添加到 PATH。");
-        ffmpeg->deleteLater();
-        return;
-    }
-    // 等待结束后恢复光标
-    connect(ffmpeg, &QProcess::finished, this, []() {
-        QApplication::restoreOverrideCursor();
-    });
 }
 
 bool VideoPlayer::eventFilter(QObject *obj, QEvent *event)
 {
+
+    // ★ 新增：OSD 上的滚轮转发给音量调整
+    if (obj == osdLabel && event->type() == QEvent::Wheel) {
+        QWheelEvent *we = static_cast<QWheelEvent*>(event);
+        adjustVolumeByWheel(we->angleDelta().y());
+        return true;   // 吞掉，不让它继续传播
+    }
+
     if (event->type() == QEvent::MouseMove) {
         QMouseEvent *me = static_cast<QMouseEvent*>(event);
         QPoint globalPos = me->globalPosition().toPoint();
@@ -3021,6 +2731,7 @@ bool VideoPlayer::eventFilter(QObject *obj, QEvent *event)
 
 void VideoPlayer::stopPlayback()
 {
+    m_loopingJumpInProgress = false;
     // 禁用所有循环
     isLooping = false;
     isABLoopEnabled = false;
@@ -3065,5 +2776,46 @@ void VideoPlayer::hideControlPanel()
         controlPanelVisible = false;
         controlPanelHideTimer->stop();
     }
+}
+
+void VideoPlayer::adjustVolumeByWheel(int deltaY)
+{
+    if (!audioOutput) return;
+
+    // ---- 1. 计算新音量，无变化直接退出 ----
+    const float step = 0.01f;
+    const float oldVol = audioOutput->volume();
+    const float v = (deltaY > 0)
+                        ? qMin(oldVol + step, 1.0f)
+                        : qMax(oldVol - step, 0.0f);
+
+    if (qFuzzyCompare(v, oldVol)) return;   // 已在 0 或 1 上限，别做无谓操作
+    audioOutput->setVolume(v);
+
+    // ---- 2. 同步滑块（只在真的变了时才调） ----
+    updateVolumeSlider(v);
+
+    // ---- 3. OSD 文本只在变化时更新，避免重排 ----
+    const int percent = static_cast<int>(qRound(v * 100));
+    const QString newText = QString("音量: %1%").arg(percent);
+    if (osdLabel->text() != newText) {
+        osdLabel->setText(newText);
+        osdLabel->adjustSize();
+    }
+
+    // ---- 4. OSD 只在首次或已隐藏时才 move + show ----
+    if (!osdLabel->isVisible()) {
+        const QPoint center = this->mapToGlobal(this->rect().center());
+        osdLabel->move(center - QPoint(osdLabel->width()/2, osdLabel->height()/2));
+        osdLabel->show();
+    }
+    // 已经可见时不 move / 不 show，位置本来就对
+
+    // ---- 5. 重启隐藏定时器 ----
+    volumeHideTimer->start(2000);
+
+    // ---- 6. QSettings 不在这里写 ----
+    // closeEvent / ~VideoPlayer 里已经会保存，滚轮期间不落盘
+    // 若担心崩溃丢数据，可改用 500ms 防抖计时器（见下）
 }
 
