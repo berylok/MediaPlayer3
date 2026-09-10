@@ -20,13 +20,13 @@ find_package(Qt6 REQUIRED COMPONENTS Core Widgets Multimedia MultimediaWidgets)
 
 # 源文件列表
 set(SOURCES
-    main.cpp
-    videoplayer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/videoplayer.cpp
 )
 
 # 头文件列表
 set(HEADERS
-    videoplayer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/videoplayer.h
 )
 
 
@@ -38,8 +38,11 @@ set(HEADERS
 # qt6_add_translation(QM_FILES ${TS_FILES})
 # 若需要将翻译文件嵌入资源，可使用 qt6_add_resource
 
+set(FORMS videoplayer.ui)
+
 # 定义可执行文件
-add_executable(MediaPlayer3 ${SOURCES} ${HEADERS} ${FORMS})
+add_executable(MediaPlayer3 ${SOURCES} ${HEADERS} ${FORMS}
+    resources.qrc)
 
 # 链接 Qt 库
 target_link_libraries(MediaPlayer3
