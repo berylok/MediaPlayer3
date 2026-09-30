@@ -37,9 +37,6 @@ set(HEADERS
 # )
 # qt6_add_translation(QM_FILES ${TS_FILES})
 # 若需要将翻译文件嵌入资源，可使用 qt6_add_resource
-
-set(FORMS videoplayer.ui)
-
 # 定义可执行文件
 add_executable(MediaPlayer3 ${SOURCES} ${HEADERS} ${FORMS}
     resources.qrc)
